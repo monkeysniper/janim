@@ -1,0 +1,248 @@
+# main.py
+import os
+import sqlite3
+import secrets
+from pathlib import Path
+from typing import Optional
+from threading import Thread
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# CONFIG from env (Replit/Railway secrets)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+STICKER_FOLDER = "stickers"
+DB_PATH = "bot_data.db"
+
+# --- DB helpers ---
+def init_db() -> None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tokens (
+        token TEXT PRIMARY KEY,
+        label TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS authorized (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    con.commit()
+    con.close()
+
+def add_token(token: str, label: str = "") -> None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO tokens(token, label) VALUES (?, ?)", (token, label))
+    con.commit()
+    con.close()
+
+def pop_token(token: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM tokens WHERE token = ?", (token,))
+    changed = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return changed
+
+def token_exists(token: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT token FROM tokens WHERE token = ?", (token,))
+    r = cur.fetchone()
+    con.close()
+    return r is not None
+
+def list_tokens() -> list:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT token, label, created_at FROM tokens ORDER BY created_at DESC")
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def add_authorized(user_id: int, username: Optional[str]) -> None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO authorized(user_id, username) VALUES (?, ?)", (user_id, username))
+    con.commit()
+    con.close()
+
+def remove_authorized(user_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM authorized WHERE user_id = ?", (user_id,))
+    changed = cur.rowcount > 0
+    con.commit()
+    con.close()
+    return changed
+
+def is_authorized(user_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT user_id FROM authorized WHERE user_id = ?", (user_id,))
+    r = cur.fetchone()
+    con.close()
+    return r is not None
+
+def list_authorized() -> list:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT user_id, username, added_at FROM authorized ORDER BY added_at DESC")
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+def gen_token(n: int = 16) -> str:
+    return secrets.token_urlsafe(n)
+
+# --- Bot handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    args = context.args
+    if args:
+        token = args[0]
+        if token_exists(token):
+            add_authorized(user.id, user.username)
+            pop_token(token)
+            await update.message.reply_text("Доступ получен! Напиши /stickers чтобы получить файлы.")
+            return
+    if is_authorized(user.id):
+        await update.message.reply_text("Ты уже авторизован. /stickers — получить файлы. /revoke_me — отозвать свой доступ.")
+    else:
+        await update.message.reply_text("Привет! У тебя нет доступа. Если у тебя есть секретная ссылка — открой её (она выглядит как https://t.me/YourBot?start=ТОКЕН).")
+
+async def stickers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_authorized(user.id):
+        await update.message.reply_text("У тебя нет доступа к этим стикерам. Используй секретную ссылку или попроси владельца дать доступ.")
+        return
+
+    folder = Path(STICKER_FOLDER)
+    if not folder.exists() or not any(folder.iterdir()):
+        await update.message.reply_text("Папка со стикерами пуста. Загрузите файлы в папку 'stickers' рядом с ботом.")
+        return
+
+    await update.message.reply_text("Отправляю файлы — они придут как изображения/видео (чтобы нельзя было добавить пак одним нажатием).")
+
+    for f in sorted(folder.iterdir()):
+        if f.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp'):
+            try:
+                await context.bot.send_photo(chat_id=user.id, photo=open(f, 'rb'))
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка при отправке {f.name}: {e}")
+        elif f.suffix.lower() in ('.webm', '.mp4', '.mov'):
+            try:
+                await context.bot.send_video(chat_id=user.id, video=open(f, 'rb'))
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка при отправке {f.name}: {e}")
+        else:
+            try:
+                await context.bot.send_document(chat_id=user.id, document=open(f, 'rb'))
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка при отправке {f.name}: {e}")
+
+async def revoke_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if remove_authorized(user.id):
+        await update.message.reply_text("Ты отозвал свой доступ.")
+    else:
+        await update.message.reply_text("У тебя не было доступа.")
+
+# admin
+async def gen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может генерировать токены.")
+        return
+    label = ' '.join(context.args) if context.args else ''
+    token = gen_token(12)
+    add_token(token, label)
+    bot_username = (await context.bot.get_me()).username
+    link = f"https://t.me/{bot_username}?start={token}"
+    await update.message.reply_text(f"Токен сгенерирован. Ссылка: {link}\nМетка: {label}")
+
+async def listtokens_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может просматривать токены.")
+        return
+    rows = list_tokens()
+    if not rows:
+        await update.message.reply_text("Токенов нет.")
+        return
+    msg = "Список токенов (token — label — created):\n"
+    for r in rows:
+        msg += f"{r[0]} — {r[1]} — {r[2]}\n"
+    await update.message.reply_text(msg)
+
+async def listauth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может просматривать авторизаций.")
+        return
+    rows = list_authorized()
+    if not rows:
+        await update.message.reply_text("Нет авторизованных пользователей.")
+        return
+    msg = "Авторизованные пользователи (id — username — added):\n"
+    for r in rows:
+        msg += f"{r[0]} — {r[1]} — {r[2]}\n"
+    await update.message.reply_text(msg)
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != OWNER_ID:
+        await update.message.reply_text("Только владелец может отзывать доступ.")
+        return
+    if not context.args:
+        await update.message.reply_text("Укажи user_id: /revoke 123456789")
+        return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Неверный user_id")
+        return
+    if remove_authorized(uid):
+        await update.message.reply_text(f"Доступ пользователя {uid} отозван.")
+    else:
+        await update.message.reply_text("Такого пользователя нет в списке.")
+
+# ===== run helper =====
+def run_flask_web():
+    from flask import Flask
+    app = Flask(__name__)
+    @app.route("/")
+    def home():
+        return "OK"
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
+
+def main():
+    if not BOT_TOKEN:
+        print("ERROR: укажи переменную окружения BOT_TOKEN")
+        return
+    init_db()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('stickers', stickers_cmd))
+    application.add_handler(CommandHandler('revoke_me', revoke_me))
+    application.add_handler(CommandHandler('gen', gen_cmd))
+    application.add_handler(CommandHandler('listtokens', listtokens_cmd))
+    application.add_handler(CommandHandler('listauth', listauth_cmd))
+    application.add_handler(CommandHandler('revoke', revoke_cmd))
+
+    t = Thread(target=run_flask_web, daemon=True)
+    t.start()
+
+    print("Bot started...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
